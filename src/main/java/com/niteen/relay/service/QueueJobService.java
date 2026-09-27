@@ -34,6 +34,20 @@ public class QueueJobService {
         return queueJobRepository.save(queueJob);
 
     }
+    public QueueJob enqueueAfter(String runId, long delaySeconds) {
+
+        LocalDateTime now = LocalDateTime.now();
+
+        QueueJob queueJob = new QueueJob();
+
+        queueJob.setRunId(runId);
+        queueJob.setStatus(QueueJobStatus.QUEUED);
+        queueJob.setAvailableAt(now.plusSeconds(delaySeconds));
+        queueJob.setAttempts(0);
+        queueJob.setCreatedAt(now);
+
+        return queueJobRepository.save(queueJob);
+    }
 
     @Transactional
     public Optional<QueueJob> claimNextJob() {

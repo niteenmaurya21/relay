@@ -6,7 +6,6 @@ import org.springframework.web.bind.annotation.*;
 import tools.jackson.databind.JsonNode;
 
 @RestController
-@RequestMapping("/workflows")
 public class RunController {
 
     private final RunService runService;
@@ -15,7 +14,7 @@ public class RunController {
         this.runService = runService;
     }
 
-    @PostMapping("/{workflowId}/trigger")
+    @PostMapping("/workflows/{workflowId}/trigger")
     public Run trigger(
             @PathVariable String workflowId,
             @RequestBody JsonNode body
@@ -23,5 +22,10 @@ public class RunController {
         JsonNode input = body.path("input");
 
         return runService.trigger(workflowId, input);
+    }
+
+    @GetMapping("/runs/{runId}")
+    public Run getRun(@PathVariable String runId) {
+        return runService.getRun(runId);
     }
 }

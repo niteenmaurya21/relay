@@ -58,4 +58,11 @@ public class RunService {
         return run;
 
     }
+    public Run getRun(String runId) {
+        return runRepository.findById(runId).orElseThrow(
+                () -> new RuntimeException("Run not found for "+runId)
+        );
+    }
+
+
 }

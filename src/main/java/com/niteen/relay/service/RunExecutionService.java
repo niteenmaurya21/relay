@@ -1,6 +1,5 @@
 package com.niteen.relay.service;
 
-
 import com.niteen.relay.entity.Run;
 import com.niteen.relay.entity.RunStatus;
 import com.niteen.relay.entity.Step;
@@ -12,7 +11,10 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 import tools.jackson.databind.node.ObjectNode;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Optional;
 
 @Service
@@ -23,164 +25,440 @@ public class RunExecutionService {
     private final StepRepository stepRepository;
     private final TemplateResolver templateResolver;
     private final NotifyNodeExecutor notifyNodeExecutor;
+    private final QueueJobService queueJobService;
+    private final DelayNodeExecutor delayNodeExecutor;
+    private final HttpRequestNodeExecutor httpRequestNodeExecutor;
 
+    public RunExecutionService(
+            RunRepository runRepository,
+            JsonMapper jsonMapper,
+            StepRepository stepRepository,
+            TemplateResolver templateResolver,
+            NotifyNodeExecutor notifyNodeExecutor,
+            QueueJobService queueJobService,
+            DelayNodeExecutor delayNodeExecutor,
+            HttpRequestNodeExecutor httpRequestNodeExecutor) {
 
-    public RunExecutionService(RunRepository runRepository,
-                               JsonMapper jsonMapper,
-                               StepRepository stepRepository,
-                               TemplateResolver templateResolver,
-                               NotifyNodeExecutor notifyNodeExecutor) {
         this.runRepository = runRepository;
         this.jsonMapper = jsonMapper;
         this.stepRepository = stepRepository;
         this.templateResolver = templateResolver;
         this.notifyNodeExecutor = notifyNodeExecutor;
+        this.queueJobService = queueJobService;
+        this.delayNodeExecutor = delayNodeExecutor;
+        this.httpRequestNodeExecutor = httpRequestNodeExecutor;
     }
 
-    public void execute(String runId){
+    public void execute(String runId) {
 
         Optional<Run> run = runRepository.findById(runId);
 
-        if(run.isEmpty()) {
+        if (run.isEmpty()) {
             return;
         }
 
         Run currentRun = run.get();
 
         currentRun.setStatus(RunStatus.RUNNING);
-        currentRun.setStartedAt(LocalDateTime.now());
+
+        if (currentRun.getStartedAt() == null) {
+            currentRun.setStartedAt(LocalDateTime.now());
+        }
 
         runRepository.save(currentRun);
 
+        try {
 
+            // Workflow definition snapshot
+            JsonNode definition = jsonMapper.readTree(
+                    currentRun.getDefinitionSnapshot()
+            );
 
-       try {
+            // Original trigger input
+            JsonNode input = jsonMapper.readTree(
+                    currentRun.getTriggerInput()
+            );
+            Map<String, JsonNode> nodeOutputs = loadNodeOutputs(runId);
 
-           //definition
-           JsonNode definition = jsonMapper.readTree(
-                   currentRun.getDefinitionSnapshot()
-           );
+            /*
+             * Resume from the persisted checkpoint.
+             * If this is the first execution, start from the workflow entry.
+             */
+            String nodeId = currentRun.getCurrentNodeId();
 
-           //input
-           JsonNode input = jsonMapper.readTree(
-                   currentRun.getTriggerInput()
-           );
+            if (nodeId == null) {
+                nodeId = definition.path("entry").asText();
+            }
 
-           String entryNodeId = definition.path("entry").asText();
+            // Find the current node
+            JsonNode nodes = definition.path("nodes");
+            JsonNode currentNode = null;
 
-           JsonNode nodes = definition.path("nodes");
-           JsonNode entryNode= null;
+            for (JsonNode node : nodes) {
+                if (nodeId.equals(node.path("id").asText())) {
+                    currentNode = node;
+                    break;
+                }
+            }
 
-           for(JsonNode node : nodes) {
-               if (entryNodeId.equals(node.path("id").asText())) {
+            if (currentNode == null) {
+                throw new RuntimeException(
+                        "Node not found: " + nodeId
+                );
+            }
 
-                   entryNode = node;
-                   break;
-               }
-           }
-               if(entryNode == null) {
-                   throw new RuntimeException(
-                           "Entry node not found: " +entryNodeId
-                   );
-               }
+            String nodeType = currentNode.path("type").asText();
+            JsonNode params = currentNode.path("params");
 
-           String nodeType = entryNode.path("type").asText();
-               if(!"notify".equals(nodeType)) {
-                   throw new RuntimeException(
-                           "Unsupported node type: " +nodeType
-                   );
-               }
-               JsonNode params = entryNode.path("params");
+            /*
+             * ---------------------------------------------------------
+             * DELAY NODE
+             * ---------------------------------------------------------
+             */
+            if ("delay".equals(nodeType)) {
 
-               String channel = params.path("channel").asText();
+                long seconds = delayNodeExecutor.getDelaySeconds(
+                        params.path("seconds").asLong()
+                );
 
-           String toTemplate = params.path("to").asText();
-               String to = templateResolver.resolve(toTemplate, input);
+                Step step = new Step();
 
-           String messageTemplate = params.path("message").asText();
-           String message = templateResolver.resolve(messageTemplate, input);
+                step.setRunId(runId);
+                step.setNodeId(nodeId);
+                step.setNodeType(nodeType);
+                step.setSequenceNumber(
+                        currentRun.getStepsExecuted() + 1
+                );
+                step.setStatus(StepStatus.PENDING);
+                step.setAttempt(0);
+                step.setIdempotencyKey(runId + ":" + nodeId);
 
-           String subject = null;
+                // Persist step before execution
+                stepRepository.save(step);
 
-           if (params.has("subject")) {
-               String subjectTemplate = params.path("subject").asText();
-               subject = templateResolver.resolve(subjectTemplate, input);
-           }
+                step.setStatus(StepStatus.RUNNING);
+                step.setStartedAt(LocalDateTime.now());
 
-           Step step = new Step();
+                stepRepository.save(step);
 
-           step.setRunId(runId);
-           step.setNodeId(entryNodeId);
-           step.setNodeType(nodeType);
-           step.setSequenceNumber(currentRun.getStepsExecuted() + 1);
-           step.setStatus(StepStatus.PENDING);
-           step.setAttempt(0);
+                // Persist resolved delay input
+                ObjectNode resolvedInput =
+                        jsonMapper.createObjectNode();
 
-           String idempotencyKey = runId + ":" + entryNodeId;
-           step.setIdempotencyKey(idempotencyKey);
+                resolvedInput.put("seconds", seconds);
 
-           stepRepository.save(step);
+                step.setResolvedInput(
+                        jsonMapper.writeValueAsString(resolvedInput)
+                );
 
-           step.setStatus(StepStatus.RUNNING);
-           step.setStartedAt(LocalDateTime.now());
+                stepRepository.save(step);
 
-           stepRepository.save(step);
-           //persist STEP as PENDING, then transition it to RUNNING
+                /*
+                 * Move the run checkpoint to the next node.
+                 */
+                String nextNodeId = currentNode.path("next").isNull()
+                        ? null
+                        : currentNode.path("next").asText();
 
-           ObjectNode resolvedInput = jsonMapper.createObjectNode();
+                currentRun.setStepsExecuted(
+                        currentRun.getStepsExecuted() + 1
+                );
 
-           resolvedInput.put("channel", channel);
-           resolvedInput.put("to", to);
-           resolvedInput.put("message", message);
+                currentRun.setCurrentNodeId(nextNodeId);
 
-           if (subject != null) {
-               resolvedInput.put("subject", subject);
-           }
+                runRepository.save(currentRun);
 
-           step.setResolvedInput(
-                   jsonMapper.writeValueAsString(resolvedInput)
-           );
+                /*
+                 * The delay itself is represented by the queue's
+                 * availableAt timestamp. We do not block the worker
+                 * with Thread.sleep().
+                 */
+                step.setStatus(StepStatus.SUCCEEDED);
+                step.setDurationMs(0L);
 
-           stepRepository.save(step);
+                stepRepository.save(step);
 
-           JsonNode output = notifyNodeExecutor.execute(
-                   channel,
-                   to,
-                   subject,
-                   message,
-                   step.getIdempotencyKey()
-           );
+                if (nextNodeId != null) {
+                    queueJobService.enqueueAfter(runId, seconds);
+                }
 
-           step.setOutput(
-                   jsonMapper.writeValueAsString(output)
-           );
+                return;
+            }
 
-           step.setStatus(StepStatus.SUCCEEDED);
-           step.setDurationMs(
-                   java.time.Duration.between(
-                           step.getStartedAt(),
-                           LocalDateTime.now()
-                   ).toMillis()
-           );
-           stepRepository.save(step);
+            /*
+             * ---------------------------------------------------------
+             * NOTIFY NODE
+             * ---------------------------------------------------------
+             */
+            if ("http_request".equals(nodeType)) {
 
-           String nextNodeId = entryNode.path("next").isNull()
-                   ? null
-                   : entryNode.path("next").asText();
+                String method = params.path("method").asText();
+                String url = params.path("url").asText();
 
-           currentRun.setStepsExecuted(
-                   currentRun.getStepsExecuted() + 1
-           );
+                JsonNode bodyTemplate = params.path("body");
 
-           currentRun.setCurrentNodeId(nextNodeId);
+                JsonNode resolvedBody = templateResolver.resolveJson(
+                        bodyTemplate,
+                        input
+                );
 
-           runRepository.save(currentRun);
+                Step step = new Step();
 
-       }
-       catch (Exception e) {
-           throw new RuntimeException("Workflow execution failed for run: "+runId,e);
-       }
+                step.setRunId(runId);
+                step.setNodeId(nodeId);
+                step.setNodeType(nodeType);
+                step.setSequenceNumber(
+                        currentRun.getStepsExecuted() + 1
+                );
+                step.setStatus(StepStatus.PENDING);
+                step.setAttempt(0);
 
+                String idempotencyKey = runId + ":" + nodeId;
+
+                step.setIdempotencyKey(idempotencyKey);
+
+                stepRepository.save(step);
+
+                step.setStatus(StepStatus.RUNNING);
+                step.setStartedAt(LocalDateTime.now());
+
+                stepRepository.save(step);
+
+                /*
+                 * Persist the resolved HTTP request.
+                 */
+                ObjectNode resolvedInput =
+                        jsonMapper.createObjectNode();
+
+                resolvedInput.put("method", method);
+                resolvedInput.put("url", url);
+                resolvedInput.set("body", resolvedBody);
+
+                step.setResolvedInput(
+                        jsonMapper.writeValueAsString(resolvedInput)
+                );
+
+                stepRepository.save(step);
+
+                /*
+                 * Execute HTTP request.
+                 */
+                JsonNode output = httpRequestNodeExecutor.execute(
+                        method,
+                        url,
+                        resolvedBody,
+                        idempotencyKey
+                );
+
+                /*
+                 * Persist HTTP response.
+                 */
+                step.setOutput(
+                        jsonMapper.writeValueAsString(output)
+                );
+
+                step.setStatus(StepStatus.SUCCEEDED);
+
+                step.setDurationMs(
+                        Duration.between(
+                                step.getStartedAt(),
+                                LocalDateTime.now()
+                        ).toMillis()
+                );
+
+                stepRepository.save(step);
+
+                /*
+                 * Move to the next node.
+                 */
+                String nextNodeId = currentNode.path("next").isNull()
+                        ? null
+                        : currentNode.path("next").asText();
+
+                currentRun.setStepsExecuted(
+                        currentRun.getStepsExecuted() + 1
+                );
+
+                currentRun.setCurrentNodeId(nextNodeId);
+
+                runRepository.save(currentRun);
+
+                if (nextNodeId != null) {
+                    queueJobService.enqueue(runId);
+                }
+
+                return;
+            }
+
+            if (!"notify".equals(nodeType)) {
+                throw new RuntimeException(
+                        "Unsupported node type: " + nodeType
+                );
+            }
+
+            String channel = params.path("channel").asText();
+
+            String toTemplate = params.path("to").asText();
+
+            String to = templateResolver.resolve(
+                    toTemplate,
+                    input
+            );
+
+            String messageTemplate = params.path("message").asText();
+
+            String message = templateResolver.resolve(
+                    messageTemplate,
+                    input,
+                    nodeOutputs
+            );
+
+            String subject = null;
+
+            if (params.has("subject")) {
+
+                String subjectTemplate =
+                        params.path("subject").asText();
+
+                subject = templateResolver.resolve(
+                        subjectTemplate,
+                        input
+                );
+            }
+
+            Step step = new Step();
+
+            step.setRunId(runId);
+            step.setNodeId(nodeId);
+            step.setNodeType(nodeType);
+            step.setSequenceNumber(
+                    currentRun.getStepsExecuted() + 1
+            );
+            step.setStatus(StepStatus.PENDING);
+            step.setAttempt(0);
+
+            /*
+             * Stable idempotency key:
+             *
+             * runId:nodeId
+             */
+            String idempotencyKey = runId + ":" + nodeId;
+
+            step.setIdempotencyKey(idempotencyKey);
+
+            // Persist PENDING step
+            stepRepository.save(step);
+
+            // Transition to RUNNING
+            step.setStatus(StepStatus.RUNNING);
+            step.setStartedAt(LocalDateTime.now());
+
+            stepRepository.save(step);
+
+            /*
+             * Persist the fully resolved node input.
+             */
+            ObjectNode resolvedInput =
+                    jsonMapper.createObjectNode();
+
+            resolvedInput.put("channel", channel);
+            resolvedInput.put("to", to);
+            resolvedInput.put("message", message);
+
+            if (subject != null) {
+                resolvedInput.put("subject", subject);
+            }
+
+            step.setResolvedInput(
+                    jsonMapper.writeValueAsString(resolvedInput)
+            );
+
+            stepRepository.save(step);
+
+            /*
+             * Execute the external notification.
+             */
+            JsonNode output = notifyNodeExecutor.execute(
+                    channel,
+                    to,
+                    subject,
+                    message,
+                    step.getIdempotencyKey()
+            );
+
+            /*
+             * Persist output and successful completion.
+             */
+            step.setOutput(
+                    jsonMapper.writeValueAsString(output)
+            );
+
+            step.setStatus(StepStatus.SUCCEEDED);
+
+            step.setDurationMs(
+                    Duration.between(
+                            step.getStartedAt(),
+                            LocalDateTime.now()
+                    ).toMillis()
+            );
+
+            stepRepository.save(step);
+
+            /*
+             * Move checkpoint to the next node.
+             */
+            String nextNodeId = currentNode.path("next").isNull()
+                    ? null
+                    : currentNode.path("next").asText();
+
+            currentRun.setStepsExecuted(
+                    currentRun.getStepsExecuted() + 1
+            );
+
+            currentRun.setCurrentNodeId(nextNodeId);
+
+            runRepository.save(currentRun);
+
+            /*
+             * Only enqueue another job when there is another node.
+             */
+            if (nextNodeId != null) {
+                queueJobService.enqueue(runId);
+            }
+
+        } catch (Exception e) {
+
+            throw new RuntimeException(
+                    "Workflow execution failed for run: " + runId,
+                    e
+            );
+        }
+    }
+
+    private Map<String, JsonNode> loadNodeOutputs(String runId) {
+
+        Map<String, JsonNode> nodeOutputs = new HashMap<>();
+
+        for (Step step : stepRepository.findByRunIdOrderBySequenceNumberAsc(runId)) {
+
+            if (step.getOutput() == null) {
+                continue;
+            }
+
+            try {
+                nodeOutputs.put(
+                        step.getNodeId(),
+                        jsonMapper.readTree(step.getOutput())
+                );
+            } catch (Exception e) {
+                throw new RuntimeException(
+                        "Failed to read output for node: " + step.getNodeId(),
+                        e
+                );
+            }
+        }
+
+        return nodeOutputs;
     }
 
 }
