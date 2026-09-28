@@ -27,7 +27,7 @@ public class RunService {
         this.queueJobService = queueJobService;
     }
 
-    public Run trigger(String workflowId, JsonNode input) {
+    public Run trigger(String workflowId, JsonNode input, String triggerType) {
 
         Workflow workflow = workflowRepository.findById(workflowId).orElseThrow(
                 () -> new RuntimeException("Workflow not found for "+workflowId)
@@ -41,7 +41,7 @@ public class RunService {
         run.setRunId(UUID.randomUUID().toString());
         run.setWorkflowId(workflowId);
         run.setStatus(RunStatus.QUEUED);
-        run.setTriggerType("manual");
+        run.setTriggerType(triggerType);
         run.setTriggerInput(
                 jsonMapper.writeValueAsString(input)
         );

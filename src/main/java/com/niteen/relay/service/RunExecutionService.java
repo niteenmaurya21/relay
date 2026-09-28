@@ -107,6 +107,42 @@ public class RunExecutionService {
                 );
             }
 
+            int maxSteps = definition
+                    .path("limits")
+                    .path("max_steps")
+                    .asInt(20);
+
+            if (currentRun.getStepsExecuted() >= maxSteps) {
+
+                currentRun.setStatus(RunStatus.FAILED);
+                currentRun.setError("Maximum step limit exceeded");
+                currentRun.setFinishedAt(LocalDateTime.now());
+
+                runRepository.save(currentRun);
+
+                return;
+            }
+
+            int timeoutSeconds = definition
+                    .path("limits")
+                    .path("timeout_seconds")
+                    .asInt(600);
+
+            if (currentRun.getStartedAt() != null
+                    && Duration.between(
+                    currentRun.getStartedAt(),
+                    LocalDateTime.now()
+            ).getSeconds() >= timeoutSeconds) {
+
+                currentRun.setStatus(RunStatus.FAILED);
+                currentRun.setError("Workflow timeout exceeded");
+                currentRun.setFinishedAt(LocalDateTime.now());
+
+                runRepository.save(currentRun);
+
+                return;
+            }
+
             String nodeType = currentNode.path("type").asText();
             JsonNode params = currentNode.path("params");
 
@@ -417,6 +453,11 @@ public class RunExecutionService {
 
             currentRun.setCurrentNodeId(nextNodeId);
 
+            if (nextNodeId == null) {
+                currentRun.setStatus(RunStatus.SUCCEEDED);
+                currentRun.setFinishedAt(LocalDateTime.now());
+            }
+
             runRepository.save(currentRun);
 
             /*
@@ -427,6 +468,16 @@ public class RunExecutionService {
             }
 
         } catch (Exception e) {
+
+            currentRun.setStatus(RunStatus.FAILED);
+            currentRun.setError(
+                    e.getCause() != null
+                            ? e.getCause().getMessage()
+                            : e.getMessage()
+            );
+            currentRun.setFinishedAt(LocalDateTime.now());
+
+            runRepository.save(currentRun);
 
             throw new RuntimeException(
                     "Workflow execution failed for run: " + runId,

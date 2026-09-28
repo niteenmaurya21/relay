@@ -1,6 +1,5 @@
 package com.niteen.relay.repository;
 
-
 import com.niteen.relay.entity.QueueJob;
 import com.niteen.relay.entity.QueueJobStatus;
 import jakarta.persistence.LockModeType;
@@ -13,7 +12,14 @@ import java.util.Optional;
 public interface QueueJobRepository extends JpaRepository<QueueJob, Long> {
 
         @Lock(LockModeType.PESSIMISTIC_WRITE)
-        Optional<QueueJob> findFirstByStatusAndAvailableAtLessThanEqualOrderByIdAsc(QueueJobStatus status,
-                                                                                    LocalDateTime now);
+        Optional<QueueJob> findFirstByStatusAndAvailableAtLessThanEqualOrderByIdAsc(
+                QueueJobStatus status,
+                LocalDateTime now
+        );
 
+        @Lock(LockModeType.PESSIMISTIC_WRITE)
+        Optional<QueueJob> findFirstByStatusAndLeaseUntilBeforeOrderByIdAsc(
+                QueueJobStatus status,
+                LocalDateTime now
+        );
 }

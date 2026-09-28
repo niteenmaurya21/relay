@@ -23,16 +23,24 @@ public class QueueWorker {
     @Scheduled(fixedDelay = 3000)
     public void processQueue() {
 
+        queueJobService.reclaimExpiredJob();
+
         Optional<QueueJob> job = queueJobService.claimNextJob();
 
-
-        if(job.isEmpty()){
+        if (job.isEmpty()) {
             return;
         }
+
         QueueJob queueJob = job.get();
-        runExecutionService.execute(queueJob.getRunId());
 
+        try {
+            runExecutionService.execute(queueJob.getRunId());
+            queueJobService.completeJob(queueJob.getId());
 
+        } catch (Exception e) {
+            // The RunExecutionService has already persisted the run as FAILED.
+            // Do not mark the queue job as COMPLETED.
+        }
     }
 
 }
