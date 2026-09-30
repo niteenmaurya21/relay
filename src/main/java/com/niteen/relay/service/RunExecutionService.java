@@ -28,6 +28,7 @@ public class RunExecutionService {
     private final QueueJobService queueJobService;
     private final DelayNodeExecutor delayNodeExecutor;
     private final HttpRequestNodeExecutor httpRequestNodeExecutor;
+    private final ConditionNodeExecutor conditionNodeExecutor;
 
     public RunExecutionService(
             RunRepository runRepository,
@@ -37,7 +38,8 @@ public class RunExecutionService {
             NotifyNodeExecutor notifyNodeExecutor,
             QueueJobService queueJobService,
             DelayNodeExecutor delayNodeExecutor,
-            HttpRequestNodeExecutor httpRequestNodeExecutor) {
+            HttpRequestNodeExecutor httpRequestNodeExecutor,
+            ConditionNodeExecutor conditionNodeExecutor) {
 
         this.runRepository = runRepository;
         this.jsonMapper = jsonMapper;
@@ -47,6 +49,7 @@ public class RunExecutionService {
         this.queueJobService = queueJobService;
         this.delayNodeExecutor = delayNodeExecutor;
         this.httpRequestNodeExecutor = httpRequestNodeExecutor;
+        this.conditionNodeExecutor = conditionNodeExecutor;
     }
 
     public void execute(String runId) {
@@ -216,6 +219,116 @@ public class RunExecutionService {
 
                 if (nextNodeId != null) {
                     queueJobService.enqueueAfter(runId, seconds);
+                }
+
+                return;
+            }
+
+            /*
+             * ---------------------------------------------------------
+             * CONDITION NODE
+             * ---------------------------------------------------------
+             */
+            if ("condition".equals(nodeType)) {
+
+                String leftTemplate = params.path("left").asText();
+                String op = params.path("op").asText();
+                String rightTemplate = params.path("right").asText();
+
+                String left = templateResolver.resolve(
+                        leftTemplate,
+                        input,
+                        nodeOutputs
+                );
+
+                String right = templateResolver.resolve(
+                        rightTemplate,
+                        input,
+                        nodeOutputs
+                );
+
+                Step step = new Step();
+
+                step.setRunId(runId);
+                step.setNodeId(nodeId);
+                step.setNodeType(nodeType);
+                step.setSequenceNumber(
+                        currentRun.getStepsExecuted() + 1
+                );
+                step.setStatus(StepStatus.PENDING);
+                step.setAttempt(0);
+                step.setIdempotencyKey(runId + ":" + nodeId);
+
+                // Persist PENDING step
+                stepRepository.save(step);
+
+                // Transition to RUNNING
+                step.setStatus(StepStatus.RUNNING);
+                step.setStartedAt(LocalDateTime.now());
+
+                stepRepository.save(step);
+
+                // Persist resolved condition input
+                ObjectNode resolvedInput =
+                        jsonMapper.createObjectNode();
+
+                resolvedInput.put("left", left);
+                resolvedInput.put("op", op);
+                resolvedInput.put("right", right);
+
+                step.setResolvedInput(
+                        jsonMapper.writeValueAsString(resolvedInput)
+                );
+
+                stepRepository.save(step);
+
+                // Evaluate condition
+                boolean result = conditionNodeExecutor.evaluate(
+                        left,
+                        op,
+                        right
+                );
+
+                // Persist condition output
+                ObjectNode output =
+                        jsonMapper.createObjectNode();
+
+                output.put("result", result);
+
+                step.setOutput(
+                        jsonMapper.writeValueAsString(output)
+                );
+
+                step.setStatus(StepStatus.SUCCEEDED);
+
+                step.setDurationMs(
+                        Duration.between(
+                                step.getStartedAt(),
+                                LocalDateTime.now()
+                        ).toMillis()
+                );
+
+                stepRepository.save(step);
+
+                // Choose branch
+                String nextNodeId;
+
+                if (result) {
+                    nextNodeId = currentNode.path("on_true").asText();
+                } else {
+                    nextNodeId = currentNode.path("on_false").asText();
+                }
+
+                currentRun.setStepsExecuted(
+                        currentRun.getStepsExecuted() + 1
+                );
+
+                currentRun.setCurrentNodeId(nextNodeId);
+
+                runRepository.save(currentRun);
+
+                if (nextNodeId != null && !nextNodeId.isBlank()) {
+                    queueJobService.enqueue(runId);
                 }
 
                 return;
