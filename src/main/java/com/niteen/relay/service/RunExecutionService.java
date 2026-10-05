@@ -1,9 +1,7 @@
 package com.niteen.relay.service;
 
-import com.niteen.relay.entity.Run;
-import com.niteen.relay.entity.RunStatus;
-import com.niteen.relay.entity.Step;
-import com.niteen.relay.entity.StepStatus;
+import com.niteen.relay.entity.*;
+import com.niteen.relay.repository.ApprovalRepository;
 import com.niteen.relay.repository.RunRepository;
 import com.niteen.relay.repository.StepRepository;
 import org.springframework.stereotype.Service;
@@ -29,6 +27,8 @@ public class RunExecutionService {
     private final DelayNodeExecutor delayNodeExecutor;
     private final HttpRequestNodeExecutor httpRequestNodeExecutor;
     private final ConditionNodeExecutor conditionNodeExecutor;
+    private final ApprovalRepository approvalRepository;
+    private final ApprovalNodeExecutor approvalNodeExecutor;
 
     public RunExecutionService(
             RunRepository runRepository,
@@ -39,7 +39,9 @@ public class RunExecutionService {
             QueueJobService queueJobService,
             DelayNodeExecutor delayNodeExecutor,
             HttpRequestNodeExecutor httpRequestNodeExecutor,
-            ConditionNodeExecutor conditionNodeExecutor) {
+            ConditionNodeExecutor conditionNodeExecutor,
+            ApprovalRepository approvalRepository,
+            ApprovalNodeExecutor approvalNodeExecutor) {
 
         this.runRepository = runRepository;
         this.jsonMapper = jsonMapper;
@@ -50,6 +52,8 @@ public class RunExecutionService {
         this.delayNodeExecutor = delayNodeExecutor;
         this.httpRequestNodeExecutor = httpRequestNodeExecutor;
         this.conditionNodeExecutor = conditionNodeExecutor;
+        this.approvalRepository = approvalRepository;
+        this.approvalNodeExecutor = approvalNodeExecutor;
     }
 
     public void execute(String runId) {
@@ -331,6 +335,80 @@ public class RunExecutionService {
                     queueJobService.enqueue(runId);
                 }
 
+                return;
+            }
+
+            /*
+             * ---------------------------------------------------------
+             * APPROVAL NODE
+             * ---------------------------------------------------------
+             */
+            if ("approval".equals(nodeType)) {
+
+                String messageTemplate = params.path("message").asText();
+
+                String message = templateResolver.resolve(
+                        messageTemplate,
+                        input,
+                        nodeOutputs
+                );
+
+                message = approvalNodeExecutor.resolveMessage(message);
+
+
+                Optional<Approval> existingApproval =
+                        approvalRepository.findByRunIdAndNodeIdAndStatus(
+                                runId,
+                                nodeId,
+                                ApprovalStatus.PENDING
+                        );
+
+                if (existingApproval.isPresent()) {
+                    currentRun.setStatus(RunStatus.WAITING_APPROVAL);
+                    currentRun.setCurrentNodeId(nodeId);
+                    runRepository.save(currentRun);
+                    return;
+                }
+
+                // Create approval request
+                Approval approval = new Approval();
+                approval.setRunId(runId);
+                approval.setNodeId(nodeId);
+                approval.setMessage(message);
+                approval.setStatus(ApprovalStatus.PENDING);
+
+                approvalRepository.save(approval);
+
+                // Create step
+                Step step = new Step();
+                step.setRunId(runId);
+                step.setNodeId(nodeId);
+                step.setNodeType(nodeType);
+                step.setSequenceNumber(
+                        currentRun.getStepsExecuted() + 1
+                );
+                step.setStatus(StepStatus.WAITING_APPROVAL);
+                step.setAttempt(0);
+                step.setIdempotencyKey(runId + ":" + nodeId);
+
+                ObjectNode resolvedInput =
+                        jsonMapper.createObjectNode();
+
+                resolvedInput.put("message", message);
+
+                step.setResolvedInput(
+                        jsonMapper.writeValueAsString(resolvedInput)
+                );
+
+                stepRepository.save(step);
+
+                // Pause the run
+                currentRun.setStatus(RunStatus.WAITING_APPROVAL);
+                currentRun.setCurrentNodeId(nodeId);
+
+                runRepository.save(currentRun);
+
+                // Do NOT enqueue another job.
                 return;
             }
 
