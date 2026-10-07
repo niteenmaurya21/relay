@@ -93,9 +93,11 @@ public class ApprovalService {
             );
         }
 
-        stepRepository.save(approvalStep);
-
         // Approval node is now a completed step.
+        run.setStepsExecuted(run.getStepsExecuted() + 1);
+
+        // Resume workflow timeout after human approval.
+        run.setStartedAt(LocalDateTime.now());
         run.setStepsExecuted(run.getStepsExecuted() + 1);
 
         try {

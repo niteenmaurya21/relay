@@ -65,4 +65,12 @@ public class WorkflowController {
         return ResponseEntity.ok(workflows);
     }
 
+    @GetMapping("/{workflowId}")
+    public ResponseEntity<Workflow> getWorkflow(
+            @PathVariable String workflowId
+    ) {
+        Workflow workflow = workflowService.getWorkflowById(workflowId);
+        return ResponseEntity.ok(workflow);
+    }
+
 }

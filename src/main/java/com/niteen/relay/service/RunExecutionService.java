@@ -12,6 +12,7 @@ import tools.jackson.databind.node.ObjectNode;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -29,6 +30,7 @@ public class RunExecutionService {
     private final ConditionNodeExecutor conditionNodeExecutor;
     private final ApprovalRepository approvalRepository;
     private final ApprovalNodeExecutor approvalNodeExecutor;
+    private final OrderActionNodeExecutor orderActionNodeExecutor;
 
     public RunExecutionService(
             RunRepository runRepository,
@@ -41,7 +43,8 @@ public class RunExecutionService {
             HttpRequestNodeExecutor httpRequestNodeExecutor,
             ConditionNodeExecutor conditionNodeExecutor,
             ApprovalRepository approvalRepository,
-            ApprovalNodeExecutor approvalNodeExecutor) {
+            ApprovalNodeExecutor approvalNodeExecutor,
+            OrderActionNodeExecutor orderActionNodeExecutor) {
 
         this.runRepository = runRepository;
         this.jsonMapper = jsonMapper;
@@ -54,6 +57,7 @@ public class RunExecutionService {
         this.conditionNodeExecutor = conditionNodeExecutor;
         this.approvalRepository = approvalRepository;
         this.approvalNodeExecutor = approvalNodeExecutor;
+        this.orderActionNodeExecutor = orderActionNodeExecutor;
     }
 
     public void execute(String runId) {
@@ -414,6 +418,145 @@ public class RunExecutionService {
 
             /*
              * ---------------------------------------------------------
+             * ORDER ACTION NODE
+             * ---------------------------------------------------------
+             */
+            if ("order_action".equals(nodeType)) {
+
+                /*
+                 * order_action is a sensitive side effect.
+                 * It is only allowed when an approval was completed
+                 * earlier in this same run.
+                 */
+                List<Approval> approvedApprovals =
+                        approvalRepository.findByRunIdAndStatus(
+                                runId,
+                                ApprovalStatus.APPROVED
+                        );
+
+                if (approvedApprovals.isEmpty()) {
+                    throw new RuntimeException(
+                            "Order action requires an approved approval in the same run"
+                    );
+                }
+
+                String action = params.path("action").asText();
+
+                String orderIdTemplate =
+                        params.path("order_id").asText();
+
+                String orderId = templateResolver.resolve(
+                        orderIdTemplate,
+                        input,
+                        nodeOutputs
+                );
+
+                Double amountUsd = null;
+
+                if (params.has("amount_usd")) {
+                    amountUsd = params.path("amount_usd").asDouble();
+                }
+
+                String idempotencyKey = runId + ":" + nodeId;
+
+                Step step = new Step();
+
+                step.setRunId(runId);
+                step.setNodeId(nodeId);
+                step.setNodeType(nodeType);
+                step.setSequenceNumber(
+                        currentRun.getStepsExecuted() + 1
+                );
+                step.setStatus(StepStatus.PENDING);
+                step.setAttempt(0);
+                step.setIdempotencyKey(idempotencyKey);
+
+                /*
+                 * Persist PENDING before executing the side effect.
+                 */
+                stepRepository.save(step);
+
+                step.setStatus(StepStatus.RUNNING);
+                step.setStartedAt(LocalDateTime.now());
+
+                stepRepository.save(step);
+
+                /*
+                 * Persist the fully resolved order action input.
+                 */
+                ObjectNode resolvedInput =
+                        jsonMapper.createObjectNode();
+
+                resolvedInput.put("action", action);
+                resolvedInput.put("order_id", orderId);
+
+                if (amountUsd != null) {
+                    resolvedInput.put("amount_usd", amountUsd);
+                }
+
+                step.setResolvedInput(
+                        jsonMapper.writeValueAsString(resolvedInput)
+                );
+
+                stepRepository.save(step);
+
+                /*
+                 * Execute the sensitive order action.
+                 */
+                JsonNode output = orderActionNodeExecutor.execute(
+                        action,
+                        orderId,
+                        amountUsd,
+                        idempotencyKey
+                );
+
+                /*
+                 * Persist output and successful completion.
+                 */
+                step.setOutput(
+                        jsonMapper.writeValueAsString(output)
+                );
+
+                step.setStatus(StepStatus.SUCCEEDED);
+
+                step.setDurationMs(
+                        Duration.between(
+                                step.getStartedAt(),
+                                LocalDateTime.now()
+                        ).toMillis()
+                );
+
+                stepRepository.save(step);
+
+                /*
+                 * Move to the next node.
+                 */
+                String nextNodeId = currentNode.path("next").isNull()
+                        ? null
+                        : currentNode.path("next").asText();
+
+                currentRun.setStepsExecuted(
+                        currentRun.getStepsExecuted() + 1
+                );
+
+                currentRun.setCurrentNodeId(nextNodeId);
+
+                if (nextNodeId == null) {
+                    currentRun.setStatus(RunStatus.SUCCEEDED);
+                    currentRun.setFinishedAt(LocalDateTime.now());
+                }
+
+                runRepository.save(currentRun);
+
+                if (nextNodeId != null) {
+                    queueJobService.enqueue(runId);
+                }
+
+                return;
+            }
+
+            /*
+             * ---------------------------------------------------------
              * NOTIFY NODE
              * ---------------------------------------------------------
              */
@@ -702,5 +845,7 @@ public class RunExecutionService {
 
         return nodeOutputs;
     }
+
+
 
 }

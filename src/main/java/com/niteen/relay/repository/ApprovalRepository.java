@@ -16,4 +16,9 @@ public interface ApprovalRepository extends JpaRepository<Approval, Long> {
             String nodeId,
             ApprovalStatus status
     );
+
+    List<Approval> findByRunIdAndStatus(
+            String runId,
+            ApprovalStatus status
+    );
 }
